@@ -24,6 +24,6 @@
 MIT License —— 全文见 [`LICENSE`](LICENSE)。
 
 ```
-Copyright (c) 2026 BZYS17Mintstar.
+Copyright (c) 2026 BZYS17Mintstar (6750432)
 Generated with the assistance of AI (DeepSeek V4), guided by human architectural intuition.
 ```
