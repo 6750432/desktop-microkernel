@@ -1,0 +1,68 @@
+Coopanion Native Host（AppImage）—— 交付说明
+2026-09-28  Coopanion Native Host整理
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+一、发什么
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+一个文件：
+
+    coopanion-native-host-x86_64.AppImage      70.4 MB
+    sha256  930a5e66a0a8bc2392dcb3b2bcb3a921e8d5bd229e80e7921d09c962474d3fc7
+
+（在 ~/Desktop/78/ 下。发 GitHub issue 可以传 release、或者挂网盘；QQ 群里直接当附件也行。）
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+二、拿到之后怎么用（两句话）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+① 直接双击（黑盒演示，什么都不用装）：
+      ./coopanion-native-host-x86_64.AppImage
+   桌面右下角出现Coopanion Native Host，自带一小段剧本（说话 / 走动 / 坐下睡觉）；
+   左上角牌子实时显示 **内存 / 渲染帧率 / CPU**，戳她、拖她、甩出去都有反应；点 ✕ 退出。
+
+② 接他们自己的 Coopanion（宿主模式）：
+      CORTICO_DESKTOP_PET_HOST='["/绝对路径/coopanion-native-host-x86_64.AppImage"]' 启动他们的应用
+   她会作为「宠物窗口」连上 World —— 走的是官方那套协议（--pet-url + WebSocket），
+   核心一行没改。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+三、这一版实测（本机，2026-09-28 晚）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+· 直接双击（演示模式）：稳定 23~24 fps，进程常驻 **76~89 MB**（含 Python 与 Qt 全在里面）。
+· 当宿主接真核心：核心 107 MB + 宿主 76 MB = **186 MB**；
+  同一天背靠背量的官方 Electron/QtWebEngine 宿主是 **626 MB（PSS 503 MB）**。
+· 包体 70.4 MB（里面自带独立 Python 3.12 + PySide6 精简版 + 你们的 whale 资产）。
+· 已验证：桌面透明置顶、只有她身上一圈吃鼠标、走出屏幕边缘会自己收窗口、
+  戳/拖/甩/睡着冒 z、气泡打字机（含标点停顿、表情按锚点触发）都正常。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+四、包里有什么（黑盒，但也不怕看）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    AppRun                      启动脚本
+    usr/bin/python3.12          独立 CPython（不需要对方系统里有 Python）
+    usr/lib/python3.12/...      PySide6 6.11 里只挑了用到的模块（QtCore/Gui/Widgets/Network/WebSockets）
+                                + 它们的 .so 依赖闭包（venv 那份 649 MB 里只用了 75 MB）
+    usr/share/Coopanion Native Host/*.py       宿主源码，明文、无混淆：身体.py / 小鱼.py / 脸.py / 网格.py /
+                                泡泡.py / 接线.py / 面板.py / 原生身体.py
+    usr/share/Coopanion Native Host/web/whale  你们的贴图与 model.json（原样携带）
+    README-quickstart.txt / LICENSE-上游-MIT.txt / NOTICE.txt
+
+许可：上游资产按上游 MIT 使用（全文随包）；宿主代码是另外写的，同样以 MIT 提供。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+五、已知限制（先说清，免得被当成 bug）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+· 还没做：音效、语音/麦克风、右键菜单、装扮窗、键盘回话、prefs.scale 热更新。
+· 只做了 Linux x86_64；没在别的发行版上试过（glibc 基线是 python-build-standalone 的，
+  一般 Ubuntu 20.04+/Fedora 都行）。
+· 极少数环境没有 FUSE 时跑不动 AppImage，加一个参数即可：
+      ./coopanion-native-host-x86_64.AppImage --appimage-extract-and-run
+· CPU 这一项没赢多少（一个核 → 半个核）：瓶颈从浏览器合成换成了「每帧拼网格」，
+  本项目量过、也写了优化方案，还没落地（详见性能报告第十一节）。
+
+
+

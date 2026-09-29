@@ -1,0 +1,451 @@
+Cyber-Microkernel Runtime v7.0（三平台宿主侧）
+—— Windows / Linux / macOS 的「宠物窗口层」：统一能力模型 + 分级降级 + 可验收
+2026-09-29  Coopanion Native Host
+
+（v7.0 = v2 的骨架 + 三平台现实矩阵 + 模拟验证 + 分发签名。
+  写作口径先说清楚，免得把设计当成事实：
+     ✅ 实测   —— 在真机跑过、有数字（本机 Linux/X11 的全部来自 2026-09-28 实测）
+     🟡 可实测 —— 本机是 Win10 双系统，能直接验（但还没验）
+     ⬜ 待验证 —— 目前没硬件/只能按协议与文档现状写（macOS、Wayland 各家的支持度）
+  凡 ⬜ 的条目都在附录 B 里带一句"怎么验、预期看到什么"，不许当结论用。）
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+零、v2 → v7.0 差在哪
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    v2（宿主侧 v2）                    v7.0
+    单平台（Linux/X11）为主            三平台对等的**能力模型**（不写"if 平台"，只写能力位）
+    能力位 8 个                       能力位扩到 **12 个**（新增：能否自己摆窗口、能否跨 Space、
+                                     能否取屏、能否拿全局输入）
+    降级链按后端                     降级链按**能力缺失**（同一套链在三平台都能跑）
+    FORCE_FAIL 注入                   **能力缺失模拟矩阵（SIMULATE）** —— 一台 Linux 也能验
+                                     Windows/macOS 的降级路径
+    （无）                           **平台现实矩阵**：每个能力在三平台的实现 / 失败模式 / 雷区
+    （无）                           分发与签名（SmartScreen / notarization / Flatpak 权限）
+    验收脚本一份                     同一份 `tools/验收.py`，三平台输出可比 JSON
+    v2 的接口/数据契约/边界表        **原样保留**，见 §5.0（v7.0 是 v2 的超集，不是替代）
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+一、目标 / 非目标 / 验证状态
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+目标：
+    同一份核心（状态机/动画/场景图）在三个桌面平台上**都能起来、按同一套规则降级、
+    并用同一份预算表被验收**。平台差异只允许出现在两处：**后端实现** 与 **策略表**。
+
+非目标（7.0 不做，做了就是负债）：
+    · 不做 GPU 后端（三平台都用 CPU 光栅；GPU 是 7.x 的性能选项，准入条件见 §6.2）；
+    · 不做"自己实现合成器"（Windows 上不做 DComp 自绘流水线；macOS 上不做 Metal 层）；
+    · 不做 GNOME Wayland 的 shell 扩展（那是另一条交付物，见 §4.3）；
+    · 不做移动端 / Web 端；
+    · 不做跨平台统一渲染抽象到"零平台代码"——**能抽象的抽象，抽象不了的用能力位显式降级**。
+
+三种"平台"的正确定义（这是全文的地基）：
+    ① 显示服务：X11 / Wayland / Win32(DWM) / Quartz
+    ② 桌面环境/合成器实现：KDE / GNOME / Sway / Windows DWM / macOS WindowServer
+    ③ 分发形态：原始可执行 / AppImage / Flatpak / MSI / 已公证 .app
+    三者的**任意组合**都可能出现，所以能力位必须由"探测"给出，不能由 os_family 推断。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+二、铁律（v2 四条 + 跨平台一条）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+铁律 1｜探测给事实，不决策。策略只出现在策略表（§5.2），不出现在 if 里。
+铁律 2｜热路径只花预算，不花判断（预算见 §6.1）。
+铁律 3｜任何降级都必须可解释、可测量：一条 JSON 日志 + 一个指标。
+铁律 4｜退出严格反序；退出阶段不再创建任何平台对象（§9.1）。
+铁律 5｜**跨平台铁律：核心代码里不允许出现平台名**（`sys.platform` / `os.name` / `win32` /
+        `x11` / `wayland` / `darwin` 一律禁止）。平台判断只允许出现在：
+          ① `backends/*` 的实现文件；② 策略表的一行；③ 探测器的读取动作。
+        CI 里用一行 grep 就能守住这条（`grep -rn "sys.platform\|os.name" core/` 必须为空）。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+三、验收口径：预算表（三平台同一张表）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚠️ 先说结论：**不要用绝对 FPS 当验收**。本机实测：把渲染压到几乎没有（≈17 次绘制调用），
+   整机也只能 145.6 fps（CPU 114%）——"窗口贴图+合成器"是 4~5 ms/帧的硬地板；屏幕 144 Hz。
+
+    ┌────────────────────────┬──────────────┬────────────────────────────────┐
+    │ 指标                    │ 门槛（三平台同）│ 说明                            │
+    ├────────────────────────┼──────────────┼────────────────────────────────┤
+    │ 帧时间 p50 / p95        │ ≤0.6× / ≤1.0× │ 目标帧时间 = 1/目标帧率；300 帧滚动 │
+    │ CPU：24 / 48 / 60 fps   │ ≤0.6 / 0.8 / │ 整棵进程树 utime+stime ÷ 真实时间 │
+    │                        │ 1.05 核       │                                │
+    │ CPU：闲置（12 fps）      │ ≤0.15 核      │ "闲置"的判据见 §6.5              │
+    │ 内存 RSS / PSS          │ ≤250 / 180 MB │ smaps_rollup / TaskInfo / 系统 API│
+    │ 冷启动 → 首帧           │ ≤1.5 s        │ 进程启动 → 第一次 present 返回    │
+    │ 降级链完整性             │ 100%          │ FORCE_FAIL × 每个后端 + SIMULATE │
+    │ 健康三问（§7.2）         │ 全绿          │ 每 10 s 一次                     │
+    │ 退出干净度               │ 20 连开连关无残留 │ 句柄/窗口/线程计数回到基线      │
+    └────────────────────────┴──────────────┴────────────────────────────────┘
+
+⚙ 本机（Linux/X11）参考值：RSS 195 MB / PSS 149 MB；冷启动 1.0 s；
+   CPU 24 fps 巡航 57~64%｜48 fps 68~75%｜60 fps 89~91%；网格 9 ms → 合并绘制 0.23 ms。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+四、平台现实矩阵（v7.0 的核心章节）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4.1 十二个能力位 × 三平台
+
+    能力位                           Windows(Win32+DWM)      Linux/X11        Linux/Wayland        macOS(Quartz)
+    can_open_display                 ✅              ✅实测   ✅(socket)  ✅
+    can_make_transparent             ✅              ✅实测   ✅          ✅
+    can_set_input_region             ✅ SetWindowRgn ✅实测   ✅ wl_surface.set_input_region   ✅ hitTest/ignoresMouseEvents
+    can_hit_test_per_pixel           ✅ WM_NCHITTEST ✅实测   🟡(客户端命中，合成器不一定理)  ✅
+    can_always_on_top                ✅ TOPMOST(+重抢) ✅实测  🟡(需 layer-shell，GNOME 不支持) ✅ level=.floating
+    can_skip_taskbar                 ✅ WS_EX_TOOLWINDOW ✅实测 🟡(xdg toplevel 属性)     ✅ .accessory/LSUIElement
+    can_position_window(自己摆坐标)    ✅              ✅实测   ❌ xdg-shell 无定位      ✅
+    can_query_pointer(全局光标)       ✅ GetCursorPos  ✅实测   ❌(无全局查询)           ✅ NSEvent.mouseLocation(需权限)
+    can_receive_global_input          🟡(低级钩子/需要权限) ✅实测  ❌                        🟡(Accessibility 权限)
+    can_capture_screen(取屏)          ✅ BitBlt/Windows.Graphics.Capture 🟡(XGetImage；合成器下取到合成后画面) ❌(必须 portal+PipeWire+用户授权) 🟡(需"屏幕录制"授权，否则黑屏)
+    can_join_all_spaces               n/a             n/a      n/a                       ✅ collectionBehavior
+    can_exclude_from_capture          ✅ SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE) ⬜(无对应) ⬜ ⬜
+
+    读法：**❌ 不是"做不到"，而是"必须改变交互模型"**。
+    例：Wayland 下 `can_position_window=false` 意味着桌宠不能自己决定站哪儿 ——
+    它只能 ① 请求合成器（layershell），② 用全屏透明层自己画（多数合成器不允许），
+    ③ 退化成"窗口贴边 + 用户自己摆"。这一条会把"宠物"变成"挂件"，设计上必须提前决定。
+
+4.2 能力缺失 → 降级链（三平台共用一套链）
+
+    | 缺失的能力              | 立即降级                                       | 用户体验变化（必须写进日志与首启提示） |
+    |------------------------|-----------------------------------------------|------------------------------------|
+    | can_make_transparent    | 用不透明底板 + 圆角裁剪                        | 能看到方框底色                       |
+    | can_set_input_region    | 退到"窗口级命中"（整窗吃鼠标）或"仅按钮命中"    | 可能挡住点击 → 必须给"穿透模式"开关    |
+    | can_hit_test_per_pixel  | 用矩形近似（包围盒），并允许用户缩小命中区       | 身体外一圈会误触                     |
+    | can_always_on_top       | 定期重抢置顶；失败则接受被遮挡                 | 会被其他窗口压住                     |
+    | can_position_window     | 只设初始位置；之后靠"移动请求 + 用户摆放"       | 她会跑到不是你想的地方                 |
+    | can_query_pointer       | 退到"事件驱动视线"（只有鼠标进窗口才看她）      | 视线跟随变迟钝                       |
+    | can_capture_screen      | 关掉背景采样/取屏相关特效                     | 特效消失（不能是黑块）                 |
+    | can_join_all_spaces     | 固定在当前 Space/桌面                         | 切空间就看不见                       |
+
+    ⚙ 共同纪律：**每一条降级都要在首启时"可见一次"**（气泡或设置里一行），
+      并写进 JSON 日志 —— 本项目的真实教训是"静默降级 = 用户以为程序坏了"。
+
+4.3 三平台各自的雷区清单
+
+    ● Windows（🟡 可实测，本机双系统就能验）
+      · 透明+每像素 alpha 有两条路：`UpdateLayeredWindow`（CPU 上传，稳但慢）
+        与 `WS_EX_NOREDIRECTIONBITMAP + DirectComposition`（快但复杂）。
+        v7.0 选前者（跟预算表对齐：先把每帧跨界调用压下来，再谈 GPU）。
+      · **点击穿透要分清两件事**：整窗穿透（`WS_EX_TRANSPARENT`）≠ 只在透明像素穿透
+        （`WM_NCHITTEST → HTTRANSPARENT` + 自己的命中测试）。桌宠要的是后者。
+      · 置顶会被别的程序抢，需要"重抢"策略（低频、事件驱动，不要轮询）。
+      · 不进 Alt-Tab 用 `WS_EX_TOOLWINDOW`；不抢焦点用 `WS_EX_NOACTIVATE`。
+      · DPI：Per-Monitor V2 + `WM_DPICHANGED`；高分屏下窗口尺寸要按 DPI 重算。
+      · 会话变化：RDP/远程桌面会改变合成与 GPU 能力 → 必须能在运行期降级（§8）。
+      · 关机/唤醒、显示器热插拔、显卡驱动重置（TDR）都要走热切换路径。
+      · 分发：未签名 exe 会被 SmartScreen 拦（"仍要运行"）；正式交付要代码签名。
+
+    ● Linux / X11（✅ 已实测）
+      · **必须有合成器**，否则 ARGB 透明退化成黑底（探测：`_NET_WM_CM_S0` 选择所有者）。
+      · 输入区用 `XShapeCombineRectangles(ShapeInput)`；外形可选。
+      · ⚙ 实测优化：**每次重设形状是一趟 X 往返**，只在"当前形状矩形 + 余量装不下新轮廓"时重设。
+      · 全局光标用 `XQueryPointer`（✅）；它也是"看向鼠标"的唯一来源。
+      · 多屏/负坐标/任务栏工作区：窗口必须夹回工作区内。
+      · 合成器 vsync：XPresent / `_NET_WM_FRAME_DRAWN`；拿不到就用定时器 + 自适应。
+
+    ● Linux / Wayland（⬜ 待验证，按协议现状写）
+      · **没合成器就没有画面**（Wayland 天生合成）；但**客户端不能自己摆窗口**：
+        `xdg-shell` 不提供坐标 —— 摆位要 `wlr-layer-shell`（wlroots/KDE 支持，
+        **GNOME Shell 目前不支持**）→ GNOME Wayland 上只能退化为挂件/贴边。
+      · 输入区：`wl_surface.set_input_region`（✅ 协议层有）。
+      · 全局光标/全局输入：**没有**（安全模型）→ 视线跟随只能事件驱动。
+      · 取屏/背景采样：必须走 `org.freedesktop.portal.ScreenCast` + PipeWire，要用户授权，
+        且拿到的是"用户选中的源"。
+      · 沙箱（Flatpak/Snap）：默认只给 Wayland socket，X11 直连被禁；portal 是唯一出口。
+      · 结论：**Wayland 上桌宠要先回答"本项目凭什么摆在这儿"**，再谈渲染。
+
+    ● macOS / Quartz（⬜ 待验证，无硬件）
+      · 窗口：`NSPanel` + `.nonactivatingPanel`；`isOpaque=false` + `backgroundColor=.clear`；
+        不抢焦点；`NSApplicationActivationPolicy.accessory`（不进 Dock）。
+      · 穿透：`ignoresMouseEvents` 是"整窗"，要"只在身上吃鼠标"得靠 `hitTest` 覆写
+        （⚠️ 与 Windows 同构：整窗穿透 ≠ 按形状穿透）。
+      · 置顶与桌面空间：`level = .floating` + `collectionBehavior = [.canJoinAllSpaces,
+        .fullScreenAuxiliary, .stationary]`；全屏 App 之上要不要可见，是个产品决策。
+      · vsync：`CVDisplayLink`（老）/ `CADisplayLink`（macOS 14+）；Retina 缩放看
+        `NSScreen.backingScaleFactor`，多屏可不同。
+      · **权限是头号雷（macOS 的 TCC：Transparency, Consent & Control）**：
+        取屏要"屏幕录制"授权（没授权取到黑屏 —— 典型静默失败）；
+        全局输入监听要"辅助功能"授权；没授权必须显式降级 + 引导去系统设置。
+      · 分发：签名 + 公证（notarization）+ Gatekeeper；用户首次打开要右键"打开"，
+        否则会被拦 —— 这一步要写进交付说明，不然会被当成"程序坏了"。
+
+4.4 平台矩阵的正确用法
+    · 这张表**不是文档**，是**探测器的验收用例**：每一个格子都要有一条自检能问出来；
+    · 表里 ⬜/🟡 的格子，落地时必须先写"模拟"，再写真机（§9）。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+五、分层与后端划分
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5.0 接口、数据契约与边界（继承 v2，三平台通用）
+
+    【四段式启动的数据契约】（全部 frozen dataclass，事实/诊断/能力三层严格分开）
+
+      ProbeResult —— 纯事实，不做决策：
+        os_family / session_type / is_remote / sandbox_type / sandbox_grants(frozenset)
+        cpu_cores / cpu_clock_hz / clock_resolution_ns
+        gpu_present / gpu_vendor / gpu_driver / gpu_api_support(list)
+        monitor_count / primary_dpi_scale / primary_refresh_hz / work_area_margin
+        **§4.1 的十二个能力位所对应的原始事实**（can_* 由这些事实 + 策略表推出）
+
+      ProbeDiagnostics —— 诊断数据，与事实分开（**禁止进策略**）：
+        total_duration_ms / probe_timeout / sub_probe_status{"GpuProbe":"ok","DisplayProbe":"timeout"}
+        ⚙ 为什么要分开：避免把"探测超时"当成"没有这个能力"——那是两码事。
+
+      CapabilityBits —— 能力抽象（不出现平台名，**就是 §4.1 那十二位**）：
+        can_open_display / can_make_transparent / can_set_input_region / can_hit_test_per_pixel
+        can_always_on_top / can_skip_taskbar / can_position_window / can_query_pointer
+        can_receive_global_input / can_capture_screen / can_join_all_spaces / can_exclude_from_capture
+        + 三个提示（hint，只给 Factory 参考，不是事实）：
+        render_backend_hint / refresh_hint / dpi_hint
+        ⚙ 命名纪律：`*_hint` 是提示、`*_grant` 是沙箱许可、其余才是事实。下游把 hint 当事实 = 这层坏了。
+
+      RuntimeConfig —— 策略合并（优先级：CLI > 环境变量 > 用户配置 > 探测推导 > 默认）：
+        renderer_preference(auto|gpu|cpu) / frame_limit_policy(vsync|30|60|unlimited)
+        idle_policy(活跃/低动/静止三段) / oversample_scale / worker_count
+        timer_policy / input_region_policy(native|window_level|software)
+        fallback_chain(list) / **冲突时把最终决策写进日志**
+
+      BackendBundle —— Factory 的产物：
+        platform(IPlatformBackend) + renderer(IRenderer) + scheduler(FrameScheduler)
+        + input_region(InputRegion) + screen_dpi(ScreenDpi) + capabilities(CapabilityBits)
+
+      BackendError —— { error_code, recoverable, context }（分类与跳过范围见 §5.3）
+
+    【核心接口】（都是 Protocol；接口层不暴露平台类型）
+        IRenderer        : render(RenderList) / present() / release()
+        IPlatformBackend : surface() / poll_events() / vsync_source() / release()
+        FrameScheduler   : tick 信号（只发"该渲染了"，不跑核心逻辑）
+        InputRegion      : set(轮廓) / hit(x,y) / policy
+        ScreenDpi        : scale() / work_area() / on_change()
+        ILogger          : debug/info/warn/error(tag, msg, **ctx) —— 输出一行一 JSON
+        Metrics          : counter/gauge/histogram（热路径只允许"加一个数"，不做格式化）
+        HealthCheck      : 每 10 s 跑健康三问（§7.2）
+        SelfCheck        : 输入区/呈现/资源三问的实现；**不得依赖后端"自报成功"**
+
+    【模块边界表】（v1.3 原表保留，补四行——这是全文最实用的一页）
+        | 模块                | 输入                     | 输出                | 严禁做的事                    |
+        | PreProbe            | 系统调用                  | ProbeResult(部分)   | 不做决策、不依赖 Qt            |
+        | PostProbe           | Qt/平台屏幕 API           | ProbeResult(显示)   | 不做决策                       |
+        | CapabilityResolver  | ProbeResult + 导入期常量   | CapabilityBits      | 不读用户偏好、不选后端          |
+        | ConfigResolver      | CapabilityBits + 偏好     | RuntimeConfig       | 不实例化后端                    |
+        | BackendFactory      | RuntimeConfig            | BackendBundle       | 不在运行期被频繁调用            |
+        | IRenderer           | RenderList               | NativeSurface       | 不判平台、不自己创建窗口表面      |
+        | IPlatformBackend    | 事件/vsync               | NativeSurface       | 不管渲染算法                    |
+        | FrameScheduler      | Vsync                    | tick 信号           | 不跑核心逻辑                    |
+        | InputRegion         | 鼠标事件 + 当前帧轮廓       | 命中结果            | 不判平台                        |
+        | ScreenDpi           | 屏幕事件                  | DPI/缩放            | 不重建后端（仅当缩放变 >5% 或 surface 失效）|
+        | ILogger             | 日志调用                  | JSON 行             | 不依赖平台库、**不在热路径打日志** |
+        | Metrics             | 埋点事件                  | 指标数据            | **不在热路径拼字符串/分配**       |
+        | HealthCheck         | 低频心跳                  | 健康事件            | **不直接改后端状态，只能发事件**   |
+        | SelfCheck           | 当前帧 + 系统状态          | 健康结论            | **不得依赖后端自报成功**          |
+
+    【关闭时序 Shutdown】（严格反序，缺一步就丢帧/崩/泄漏）
+        ① 停 FrameScheduler ② 等当前 render 完成 ③ 停 Worker 并 drain
+        ④ IRenderer.release() ⑤ IPlatformBackend.release()（窗口/形状/句柄在这里还）
+        ⑥ 关闭 ILogger / Metrics（最后关，前面每一步都要能记日志）
+        ⚙ 铁律：退出阶段不再创建任何平台对象；验收 = 连开连关 20 次、句柄数回到基线。
+
+5.1 后端清单（每个平台 2~3 个 + 一个永远可用的兜底）
+
+    Linux：  backends/linux_x11.py       （✅ 已实现：透明置顶 + XShape 输入区 + 跟随窗口）
+             backends/linux_wayland.py   （⬜ layer-shell 优先，xdg-shell 退化）
+             backends/raster.py          （✅ 终极兜底：最笨的窗口 + 全矩形命中）
+    Windows：backends/win32_layered.py   （🟡 UpdateLayeredWindow + WM_NCHITTEST 穿透）
+             backends/win32_basic.py     （🟡 不透明/矩形兜底）
+    macOS：  backends/macos_panel.py     （⬜ NSPanel + hitTest）
+             backends/macos_basic.py     （⬜ 普通窗口兜底）
+
+    铁律：**raster/basic 兜底永远可用，且必须最先写完**（它保证"最差也能跑"）。
+
+5.2 能力 → 策略表（三平台合并版；策略层全部内容就这一张表）
+
+    | 能力组合                                    | 策略                                         |
+    |--------------------------------------------|----------------------------------------------|
+    | input_region=true                          | 形状命中；否则窗口级命中 + 首启提示             |
+    | hit_test_per_pixel=true 且 region=true      | 逐像素命中（用当前帧 alpha）                    |
+    | position=true                              | 自摆坐标 + 跟随移动                            |
+    | position=false                             | 只设初始位置；移动改成"请求 + 动画提示"          |
+    | on_top=true 且 skip_taskbar=true            | 标准宠物窗口                                   |
+    | on_top=false 或 skip_taskbar=false          | 挂件模式（并提示用户）                          |
+    | capture=true 且 global_pointer=true          | 全特效（背景采样 + 视线跟随）                    |
+    | capture=false                              | 关闭取屏类特效；其它照旧                        |
+    | gpu 可用 且 renderer_preference∈{auto,gpu}   | 允许 GPU 后端（7.x；7.0 默认仍是 raster）        |
+    | is_remote=true                             | 强制 raster + 降帧 + 关特效                     |
+
+5.3 回退链与错误分类 × 跳过范围（跨平台）
+
+    gpu_*        → 跳过所有 GPU 后端（本会话）
+    display_*    → 跳过同显示服务后端（同会话）
+    permission_* → 跳过同类权限受限后端；**同时记一条"要去系统设置开权限"的提示**
+    input_*      → 只降级输入方式，不换后端
+    present_*    → 先降刷新策略；连续 2 次才升级为换后端
+    position_*   → 只降级摆位能力（Wayland 常态）
+
+    每个后端必须支持 `FORCE_FAIL=<error_code>`（V7.0-alpha 必做，不是测试细节）。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+六、运行期：预算、帧源、输入、位置、闲置
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6.1 每帧两条预算（三平台同）
+
+    ⚙ 实测依据：一帧 547 格的逐格绘制 36.4 ms；合并成 17 块后 0.23 ms；
+      一次 Python→Qt 绘制调用 10~22 µs；每格现场造 Qt 对象 8~9 µs。
+      → 在脚本语言宿主里，帧率由"每帧跨界调用次数"决定，不由算法决定。
+
+    | 预算                     | 门槛            | 当前        |
+    |-------------------------|----------------|------------|
+    | 每帧 → 渲染后端的调用次数   | ≤ 200          | 547        |
+    | 每帧新建的平台对象数        | ≤ 400          | 约 4400     |
+
+6.2 帧源（vsync）三平台与"没有 vsync 时"
+    Windows：DWM 合成时钟（`DwmFlush` / `DwmGetCompositionTimingInfo`）；
+    X11：XPresent / 帧回调；Wayland：`wl_surface.frame` 回调；
+    macOS：CVDisplayLink / CADisplayLink。
+    **统一抽象**：`VsyncSource.next_deadline()`；拿不到真 vsync 时退到"高精度定时器 + 自适应
+    （按实测帧时间调周期）"，并把"当前帧源"写进日志（因为调度抖动会直接体现为 p95 超标）。
+
+6.3 输入区（统一抽象）
+    接口：`InputRegion.set(polygon_or_rects)`；
+    实现：X11=XShape / Wayland=wl_surface / Windows=SetWindowRgn 或逐像素 hit-test /
+          macOS=hitTest 覆写。
+    ⚙ 纪律：**只在轮廓变化超过余量时才重设**（一次重设 = 一趟系统调用/往返）。
+
+6.4 窗口位置的三档能力
+    ① 能自己摆（X11/Win32/macOS）→ 自摆 + 平滑跟随；
+    ② 只能请求（Wayland/layer-shell）→ 把"位置"降级为"锚点请求"（贴边/居中/某块屏幕的底部），
+       并把用户看到的"走动"改成小幅位移 + 原地动作；
+    ③ 完全不能摆（GNOME Wayland）→ 宠物退化为"挂件窗口"，产品上必须明确告知。
+
+6.5 闲置策略（三平台同；桌宠是常驻进程）
+    ⚙ 实测：闲时从 24 fps 降到 12 fps，CPU 少一半，肉眼无差。
+    判据不是"有没有东西在动"，而是"**画面真的变了多少**" ——
+    ⚠️ 本项目踩过：睡觉时冒的 z 粒子被当成"忙"，她睡着反而最费 CPU（58%）。
+    三段：活跃（满帧）/ 低动（半帧）/ 静止（四分之一帧 + 降精度重绘）。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+七、可观测性：日志、指标、健康三问
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7.1 日志：从第一天起就是「一行一 JSON」
+    {"ts":…,"lv":"info","tag":"frame","ev":"stats","n":300,"p50_ms":16.8,"p95_ms":22.1,
+     "cross_calls":196,"new_objs":388,"cpu_pct":58.2,"rss_mb":195,"vsync":"x11_present"}
+    热路径禁止打日志；日志只出现在启动、重配、健康检查、每 N 帧一次的统计。
+
+7.2 健康三问（**三平台同构，这是最容易漏的一节**）
+    问一｜输入区还在她身上吗？—— 当前帧轮廓 vs 实际设给系统的命中区。
+          Windows：窗口区域/hit-test 结果；macOS：hitTest 的返回；X11：XShape 区。
+    问二｜画面真的变了吗？—— present 成功 ≠ 屏幕上有东西。
+          三平台都能做：取固定几像素/一帧缩略图与上帧比，连续 N 帧全同即失败。
+    问三｜资源在涨吗？—— 句柄/纹理/RSS 的单调性（不是绝对值）。
+    任一失败 → 发健康事件 → 按 §8 降级，并记一条 JSON（铁律 3）。
+
+7.3 HealthCheck：10 s 一次；连续 2~3 次失败才升级为热切换；切换后有冷却与指数退避。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+八、热切换与降级（三平台事件表）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    | 事件                              | Windows        | Linux            | macOS         |
+    |----------------------------------|----------------|------------------|---------------|
+    | DPI/缩放变化                      | WM_DPICHANGED  | XRandR/属性      | backingScaleFactor 变化 |
+    | 跨屏/工作区变化                    | ✅             | ✅               | ✅            |
+    | 合成器/显示服务切换                 | （RDP 会话）    | X11↔Wayland(重启) | （登录会话切换） |
+    | GPU 丢失/TDR                      | ✅             | ✅               | ⬜            |
+    | 权限被撤销（macOS 取屏/辅助功能）    | n/a            | n/a              | ✅ 必须处理    |
+    | 用户改配置                        | ✅             | ✅               | ✅            |
+
+    防抖按事件类型配置（不搞一刀切）：
+        DPI/跨屏 50~100 ms；GPU 丢失/TDR **立即处理不防抖**；显示服务重启本身已足够晚，无需防抖；
+        用户改配置走"合并 300 ms 后生效"（避免拖滑块时反复重建）。
+    承诺分级（同 v2）：DPI/跨屏/配置 → **画面不黑**；显示服务切换/后端降级 → **状态不丢，
+    画面允许 ≤3 帧重建**。铁律：状态机与时间轴在切换中持续运行。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+九、模拟与验证：没有三台机器，也要能验三平台
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+9.1 SIMULATE 注入（本机的"假平台"）
+    `SIMULATE=no_compositor,no_input_region,no_position,no_on_top,no_capture,no_vsync,remote`
+    · 探测器读环境变量后，把相应能力位置 false；
+    · 策略层与降级链照真实路径跑（**不是 mock 后端，而是同一后端的能力缺失**）；
+    · 验收脚本对每组 SIMULATE 跑一遍，断言"降级生效 + 日志可解释 + 健康三问不误报"。
+    ⚙ 意义：一台 Linux 就能把 Windows/macOS 的降级路径压完 80%，
+      真机只需要验"平台实现对不对"，不需要验"降级逻辑对不对"。
+
+9.2 CI 矩阵
+    | 维度        | 取值                                                        |
+    |------------|-------------------------------------------------------------|
+    | 平台        | linux-x11 / linux-wayland / windows / macOS（后三者有机器就跑） |
+    | 后端        | 每个后端 × FORCE_FAIL=1                                      |
+    | 能力组合     | 8 组 SIMULATE（§9.1）                                        |
+    | 预算        | p50/p95、三档 CPU、内存、冷启动、退出干净度                     |
+
+9.3 人工验收清单（每平台 10 条，10 分钟能跑完）
+    ① 双击起来、5 秒内出现 ② 透明且无方框 ③ 点身体有反应、点旁边穿过去 ④ 拖动能动
+    ⑤ 置顶（用别的窗口压它）⑥ 不进任务栏/Dock ⑦ 切桌面/空间还在 ⑧ 拔插显示器位置正确
+    ⑨ 待机 10 分钟 CPU 回到闲置档 ⑩ 退出无残留进程
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+十、分发与签名（跨平台交付；v1.3/v2 都没写）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    Windows：未签名 exe 会被 SmartScreen 拦（"仍要运行"）→ 交付要么签名（EV/OV 证书），
+             要么在说明里写清"点更多信息→仍要运行"这条路。
+    macOS：必须签名 + 公证（notarization），否则 Gatekeeper 拦；用户首次要右键"打开"。
+    Linux：AppImage（自带运行时，依赖最少）/ Flatpak（权限清单要写清楚：需要哪些 portal）。
+    三条共通的纪律：**把"权限/信任"的每一步写进 README** —— 用户被拦一次就会认为程序坏了。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+十一、与上游的接口面（三平台一致，就三个入口）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    ① 拉起：`CORTICO_DESKTOP_PET_HOST='["<命令>","<参数>"]'`，末尾追加 `--pet-url=…`；
+    ② 数据面：`ws://…/socket?role=pet&host=window`
+       下行：init/say/act/walk/listen/thinking/prefs/ask/dialog*
+       上行：hello/touch/mode/arrived/interrupted/answer/confirmed/control
+    ③ 窗口能力面（`window.petHost`）：置顶、透明、跳过任务栏、输入区、光标、
+       取屏采样、装扮窗、焦点 —— **每个能力都要写"没有时怎么退化"**（就是 §4.2 那张表）。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+十二、分期（V7.0 内部四个阶段，每阶段一个门槛）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    7.0-alpha（Linux/X11 打磨）  预算表全绿 + 健康三问 + SIMULATE 八组全过
+                                 （现状：预算未达标——跨界 547 次/帧，需合并绘制）
+    7.0-beta（Wayland + Windows）layer-shell 后端 + win32_layered；CI 矩阵上双平台
+    7.0-rc（macOS + 交付）        NSPanel 后端 + 权限降级 + 签名公证 + 三平台人工清单
+    7.0（发布）                   三平台验收矩阵全绿；发布物 = 三平台安装包 + README 权限说明
+
+    ⚠️ 每阶段的唯一门槛是"**上一阶段的验收数据**"，不是"功能写完"。
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+附录 A：本机基准常数（Linux/X11 实测，2026-09-28）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    整机帧率上限（渲染压到几乎为 0）145.6 fps（CPU 114%；窗口+合成器地板 4~5 ms/帧）
+    屏幕 144 Hz｜一帧 547 格网格 36.4 ms｜合并绘制 0.23 ms
+    一次跨界绘制调用 10~22 µs｜每格现场建对象 8~9 µs｜每格总成本 57~67 µs
+    内存：Chromium 路线 626 MB → 原生宿主 195 MB（PSS 503 → 149）
+    冷启动到窗口 1.8 s → 1.0 s｜CPU 24/48/60 fps = 57~64% / 68~75% / 89~91%
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+附录 B：待验证清单（每条的验法与预期；⚠️ 不许当结论用）
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+    B1 Windows 透明+穿透：跑 win32_layered 最小样例，预期"透明无方框 + 点旁边穿过去"；
+       若 UpdateLayeredWindow 在高分屏下模糊 → 换 `WS_EX_NOREDIRECTIONBITMAP + DComp`（记录代价）。
+    B2 Windows 置顶被抢的频率：观察 10 分钟，看是否需要"重抢"以及频率。
+    B3 Windows 远程桌面（RDP）：连一次，预期触发 is_remote=true → 强制 raster + 降帧。
+    B4 Wayland（KDE/Sway）：验证 layer-shell 能定位；GNOME 上验证"不能定位"的降级是否符合预期。
+    B5 Wayland 取屏：portal ScreenCast 走通一次，记录"用户授权"交互代价。
+    B6 macOS hitTest 穿透：最小样例验证"只在她身上吃鼠标"。
+    B7 macOS 取屏权限：未授权时确认是"黑屏"（静默失败）而不是报错 → 对应 §7.2 问二。
+    B8 macOS Spaces/全屏：collectionBehavior 的实际表现（全屏 App 之上是否可见）。
+    B9 三平台的闲置降帧：各自待机 10 分钟，验证 CPU 回到闲置档（§6.5）。
+    B10 退出干净度：三平台各 20 连开连关，句柄/窗口数回到基线。

@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+logs/
+output/
+*.log
+*.pid
+*.AppImage
+*.zip
+*.img
+*.onnx
+*.gguf
